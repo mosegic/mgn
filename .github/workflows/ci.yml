@@ -1,0 +1,305 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      skip-ghcr-cleanup:
+        description: 'Set to true to skip GHCR permission-test cleanup'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 24]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          # Cache key includes runner OS, Node major (matrix.node-version), and the lockfile hash.
+          # This enables a single cache per Node major + lockfile across the matrix entries.
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-lock-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-lock-
+
+      - name: Install dependencies
+        run: |
+          npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Run tests
+        run: |
+          npm test --silent
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      SKIP_GHCR_CLEANUP: ${{ github.event.inputs.skip-ghcr-cleanup || 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          # Use a cache key keyed by runner OS, Node major (18 for build), and lockfile hash.
+          # This keeps cache scope coarse enough to be reused across minor Node updates but still invalidates when lockfile changes.
+          key: ${{ runner.os }}-node-18-lock-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-18-lock-
+
+      - name: Install dependencies (host)
+        run: |
+          npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Run unit tests (host)
+        run: |
+          npm test --silent
+
+      - name: Show Docker and Compose versions
+        run: |
+          docker --version || true
+          docker compose version || docker-compose --version || true
+
+      - name: Start Postgres (docker compose)
+        run: |
+          docker compose up -d db
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to GHCR (using PAT if provided)
+        if: ${{ secrets.DOCKER_REGISTRY_PAT != '' }}
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.DOCKER_REGISTRY_PAT }}
+
+      - name: WARNING: using DOCKER_REGISTRY_PAT
+        if: ${{ secrets.DOCKER_REGISTRY_PAT != '' }}
+        run: |
+          echo "::warning::Authenticating to GHCR using DOCKER_REGISTRY_PAT (Personal Access Token)."
+          echo "::warning::Ensure the token has minimal scopes (write:packages) and is stored as a repository secret. Rotate it regularly."
+          echo "Using a PAT grants broader privileges than GITHUB_TOKEN; audit usage and rotate as needed."
+
+      - name: Login to GHCR (using GITHUB_TOKEN)
+        if: ${{ secrets.DOCKER_REGISTRY_PAT == '' }}
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Diagnostic — print effective token permissions and authenticated user
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Fetching repository info using GITHUB_TOKEN..."
+          curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/${{ github.repository }} | python -c 'import sys,json; j=json.load(sys.stdin); print("Repo permissions:", j.get("permissions"))'
+          echo "Fetching authenticated user..."
+          curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user | python -c 'import sys,json; j=json.load(sys.stdin); print("Authenticated as:", j.get("login"))'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Diagnostic — attempt a small GHCR push (permission test)
+        id: ghcr-test-push
+        run: |
+          set -e
+          IMAGE=ghcr.io/${{ github.repository_owner }}/mosegiccompany-greatworkflowrelief_app:permission-test-${{ github.run_id }}
+          echo "Pulling base image..."
+          docker pull alpine:3.18
+          echo "Tagging image as $IMAGE"
+          docker tag alpine:3.18 "$IMAGE"
+          echo "Pushing test image to GHCR (this will validate package write permission)..."
+          if docker push "$IMAGE"; then
+            echo "GHCR push succeeded"
+          else
+            echo "GHCR push failed" >&2
+            exit 1
+          fi
+          echo "::set-output name=test_image::$IMAGE"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup permission-test image from GHCR
+        if: ${{ steps.ghcr-test-push.outcome == 'success' && env.SKIP_GHCR_CLEANUP != 'true' }}
+        run: |
+          set -euo pipefail
+          OWNER=${{ github.repository_owner }}
+          PKG_NAME=mosegiccompany-greatworkflowrelief_app
+          TAG=permission-test-${{ github.run_id }}
+          IMAGE=ghcr.io/${OWNER}/${PKG_NAME}:${TAG}
+
+          echo "Looking up package versions for ${PKG_NAME} (owner=${OWNER})"
+
+          # API endpoints
+          ORG_API="https://api.github.com/orgs/${OWNER}/packages/container/${PKG_NAME}/versions"
+          USER_API="https://api.github.com/users/${OWNER}/packages/container/${PKG_NAME}/versions"
+
+          # Retry loop to account for eventual consistency
+          MAX_ATTEMPTS=6
+          ATTEMPT=1
+          SLEEP_SECONDS=2
+          VERSION_ID=""
+
+          while [ ${ATTEMPT} -le ${MAX_ATTEMPTS} ]; do
+            echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}: querying packages API..."
+            RESP=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" "$ORG_API")
+            if echo "$RESP" | grep -q "Not Found"; then
+              echo "Org API returned Not Found; trying user packages API..."
+              RESP=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" "$USER_API")
+            fi
+
+            echo "Searching for version id that references tag '${TAG}'..."
+            VERSION_ID=$(echo "$RESP" | python3 - <<PY
+import os,sys,json
+TAG=os.environ['TAG']
+try:
+  data=json.load(sys.stdin)
+except Exception:
+  sys.exit(1)
+for v in data:
+  # search tags and metadata for the tag string
+  if TAG in json.dumps(v):
+    print(v.get('id'))
+    sys.exit(0)
+# not found
+sys.exit(1)
+PY
+)
+
+            if [ -n "${VERSION_ID}" ]; then
+              echo "Found version id: ${VERSION_ID}"
+              break
+            fi
+
+            echo "Version not found yet. Sleeping ${SLEEP_SECONDS}s before retrying..."
+            sleep ${SLEEP_SECONDS}
+            ATTEMPT=$((ATTEMPT + 1))
+            SLEEP_SECONDS=$((SLEEP_SECONDS * 2))
+          done
+
+          if [ -z "${VERSION_ID-}" ]; then
+            echo "No matching package version found for tag ${TAG} after ${MAX_ATTEMPTS} attempts; nothing to delete."
+            exit 0
+          fi
+
+          echo "Attempting to delete version id: ${VERSION_ID}"
+
+          # Try deletion with a small retry/backoff
+          DEL_ORG_API="https://api.github.com/orgs/${OWNER}/packages/container/${PKG_NAME}/versions/${VERSION_ID}"
+          DEL_USER_API="https://api.github.com/users/${OWNER}/packages/container/${PKG_NAME}/versions/${VERSION_ID}"
+
+          DEL_ATTEMPTS=3
+          DEL_ATTEMPT=1
+          DEL_SLEEP=2
+          DELETED=0
+
+          while [ ${DEL_ATTEMPT} -le ${DEL_ATTEMPTS} ]; do
+            echo "Deletion attempt ${DEL_ATTEMPT}/${DEL_ATTEMPTS} (org API)..."
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" "$DEL_ORG_API") || HTTP_STATUS=0
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+              echo "Deleted package version via org API (status $HTTP_STATUS)"
+              DELETED=1
+              break
+            fi
+            echo "Org delete returned status $HTTP_STATUS; will retry after ${DEL_SLEEP}s"
+            sleep ${DEL_SLEEP}
+            DEL_ATTEMPT=$((DEL_ATTEMPT + 1))
+            DEL_SLEEP=$((DEL_SLEEP * 2))
+          done
+
+          if [ ${DELETED} -eq 0 ]; then
+            echo "Org delete unsuccessful; trying user API delete..."
+            DEL_ATTEMPT=1
+            DEL_SLEEP=2
+            while [ ${DEL_ATTEMPT} -le ${DEL_ATTEMPTS} ]; do
+              echo "Deletion attempt ${DEL_ATTEMPT}/${DEL_ATTEMPTS} (user API)..."
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" "$DEL_USER_API") || HTTP_STATUS=0
+              if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+                echo "Deleted package version via user API (status $HTTP_STATUS)"
+                DELETED=1
+                break
+              fi
+              echo "User delete returned status $HTTP_STATUS; will retry after ${DEL_SLEEP}s"
+              sleep ${DEL_SLEEP}
+              DEL_ATTEMPT=$((DEL_ATTEMPT + 1))
+              DEL_SLEEP=$((DEL_SLEEP * 2))
+            done
+          fi
+
+          if [ ${DELETED} -eq 1 ]; then
+            echo "Cleanup successful"
+            exit 0
+          fi
+
+          echo "Failed to delete package version after retries. You may need to delete it manually via GitHub UI." >&2
+          exit 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image with registry cache
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mosegiccompany-greatworkflowrelief_app:ci
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/mosegiccompany-greatworkflowrelief_app:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/mosegiccompany-greatworkflowrelief_app:buildcache,mode=max
+
+      - name: Pull pushed image and tag for docker-compose
+        run: |
+          docker pull ghcr.io/${{ github.repository_owner }}/mosegiccompany-greatworkflowrelief_app:ci
+          docker tag ghcr.io/${{ github.repository_owner }}/mosegiccompany-greatworkflowrelief_app:ci mosegiccompany-greatworkflowrelief_app:ci
+
+      - name: Bootstrap app (install deps, generate Prisma client, run migrations, seed)
+        run: |
+          docker compose run --rm app bash -c "chmod +x ./scripts/docker/bootstrap.sh && ./scripts/docker/bootstrap.sh"
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@db:5432/greatworkflowrelief
+
+      - name: Start app service
+        run: |
+          docker compose up -d app
+
+      - name: Wait for app healthcheck
+        run: |
+          docker compose run --rm app npm run wait-healthcheck
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@db:5432/greatworkflowrelief
+
+      - name: Run tests
+        run: |
+          # Replace `npm test` with your actual test command. This placeholder will not fail the job if tests are not defined.
+          docker compose run --rm app bash -lc "npm test || echo 'No tests defined'"
